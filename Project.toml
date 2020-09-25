@@ -1,0 +1,7 @@
+name = "Scalpels"
+uuid = "17b2198d-36ea-452c-8144-ba1790da919f"
+authors = ["Eric Ford"]
+version = "0.0.1"
+
+[compat]
+julia = "1.5"
