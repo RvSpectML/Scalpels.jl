@@ -1,4 +1,39 @@
+# Julia
 *.jl.*.cov
 *.jl.cov
 *.jl.mem
+/profiling
+
+/Manifest.toml
+/docs/Manifest.toml
+/examples/Manifest.toml
+/notebooks/Manifest.toml
+/test/Manifest.toml
+
+# Large files to be downloaded outside of git
+/data/large
+
+# Temporary files
+tmp.jl
+/examples/output
+/examples/old
+/plots
+/test/testdir
+
+# Documenter
 /docs/build/
+/docs/site/
+
+# Jupyter
+/notebooks
+.ipynb_checkpoints
+*/.ipynb_checkpoints/*
+
+# MacOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# VScode
+.vscode
