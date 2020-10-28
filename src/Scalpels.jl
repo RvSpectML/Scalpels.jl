@@ -15,7 +15,7 @@ using LinearAlgebra
 default_max_num_basis = 16
 default_num_basis = 4
 
-include("scalpels.jl")
+include("scalpels_code.jl")
 export clean_rvs_scalpels, calc_clean_rvs_scores_basis_scalpels, rms_clean_rvs_vs_num_basis_scalpels
 
 end
