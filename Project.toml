@@ -1,7 +1,7 @@
 name = "Scalpels"
 uuid = "17b2198d-36ea-452c-8144-ba1790da919f"
 authors = ["Eric Ford"]
-version = "0.0.2"
+version = "0.1.0"
 
 [deps]
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
