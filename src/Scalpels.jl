@@ -1,21 +1,46 @@
+# src/Scalpels.jl
 """
-Module for performing Scalpels (Self-Correlation Analysis of Line Profiles for Extracting Low-amplitude Shifts)
-based on a CCF timeseries.
+    Scalpels
 
-For algorithm information, see Collier-Cameron, Ford, Shahaf et al. 2020
+A Julia package for removing stellar activity signals from radial velocity (RV)
+measurements using the SCALPELS method (Collier Cameron et al. 2021) and its
+extensions.
 
-Author: Eric Ford
-Date:   September 2020
+SCALPELS exploits the shape information encoded in cross-correlation functions
+(CCFs) to separate activity-driven RV variations from Keplerian signals. This
+package extends the original Julia package by adding leave-one-out cross-validation (LOOCV)
+based cleaning (`vscalpels_*` functions) and quality-control diagnostics.
+
+# References
+- Collier Cameron et al. (2021), MNRAS, 505, 1699
+
+# Authors: Eric Ford, Andrew Collier Cameron, Claude
+Date:   September 2020, April 2026
+
 """
 module Scalpels
 
 using Statistics, StatsBase
 using LinearAlgebra
 
-default_max_num_basis = 16
-default_num_basis = 4
+export clean_rvs_scalpels,
+       calc_basis_scores_scalpels,
+       rms_clean_rvs_vs_num_basis_scalpels,
+       loocv,
+       reorder_uloocv,
+       vscalpels_loocv,
+       vscalpels_recover_loocv,
+       mask_outliers,
+       quality_control,
+       make_period_list,
+       svd_reconstruction
 
-include("scalpels_code.jl")
-export clean_rvs_scalpels, calc_clean_rvs_scores_basis_scalpels, rms_clean_rvs_vs_num_basis_scalpels
+include("internals.jl")
+include("original.jl")
+include("loocv.jl")
+include("diagnostics.jl")
+include("utils.jl")
 
-end
+include("Simulation/Simulation.jl")
+
+end # module Scalpels

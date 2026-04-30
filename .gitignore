@@ -12,6 +12,7 @@
 
 # Large files to be downloaded outside of git
 /data/large
+/data
 
 # Temporary files
 tmp.jl
