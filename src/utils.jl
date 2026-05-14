@@ -38,6 +38,98 @@ function make_period_list(
 end
 
 """
+    estimate_continuum(v_grid, ccf; quantile_level=0.9,
+                       line_half_width=15000.0, v_center=0.0) -> Float64
+
+Estimate the continuum level of a single CCF by taking a high quantile of the
+CCF values at velocities outside a central exclusion window.
+
+Pixels with `|v - v_center| < line_half_width` are excluded before computing
+the quantile, preventing the line core from biasing the continuum estimate
+downward.
+
+# Arguments
+- `v_grid`: Velocity grid in m/s, length `num_vel_bins`.
+- `ccf`: CCF values, length `num_vel_bins`.
+
+# Keyword Arguments
+- `quantile_level`: Quantile used for the continuum estimate (default 0.9).
+- `line_half_width`: Half-width of the line-core exclusion region in m/s
+  (default 15000.0, i.e. ±15 km/s). Must be narrow enough to leave at least
+  one unmasked velocity bin.
+- `v_center`: Velocity of the line centre in m/s (default 0.0). Pixels within
+  `line_half_width` of this value are excluded.
+"""
+function estimate_continuum(
+        v_grid::AbstractVector,
+        ccf::AbstractVector;
+        quantile_level::Real = 0.9,
+        line_half_width::Real = 15000.0,
+        v_center::Real = 0.0
+    )
+    @assert length(v_grid) == length(ccf)
+    mask = abs.(v_grid .- v_center) .>= line_half_width
+    @assert any(mask) "line_half_width=$line_half_width excludes all velocity bins; reduce it"
+    return mean(view(ccf, mask)) #, quantile_level)
+end
+
+"""
+    estimate_continuum(v_grid, ccfs::AbstractMatrix; quantile_level=0.9,
+                       line_half_width=15000.0, v_center=0.0) -> Vector{Float64}
+
+Estimate the continuum level for each observation (column) in a 2-D CCF matrix
+of shape `(num_vel_bins, num_obs)`.
+
+Returns a vector of length `num_obs`.
+
+See also: [`estimate_continuum`](@ref) for the single-CCF method.
+"""
+function estimate_continuum(
+        v_grid::AbstractVector,
+        ccfs::AbstractMatrix{T};
+        quantile_level::Real = 0.9,
+        line_half_width::Real = 15000.0,
+        v_center::Real = 0.0
+    ) where {T<:Real}
+    continuum = zeros(T, size(ccfs,2))
+    for ord in 1:size(ccfs,2)
+        continuum[ord] = estimate_continuum(v_grid, view(ccfs, :, ord);
+                                quantile_level, line_half_width, v_center)
+        end
+    return continuum
+end
+
+"""
+    estimate_continuum(v_grid, ccfs::AbstractArray{T,3}; quantile_level=0.9,
+                       line_half_width=15000.0, v_center=0.0) -> Matrix{Float64}
+
+Estimate the continuum level for each `(order, observation)` pair in a 3-D CCF
+array with axes `(num_vel_bins, num_orders, num_obs)`.
+
+Returns a matrix of shape `(num_orders, num_obs)`.
+
+See also: [`estimate_continuum`](@ref) for the single-CCF method.
+"""
+function estimate_continuum(
+        v_grid::AbstractVector,
+        ccfs::AbstractArray{T,3};
+        quantile_level::Real = 0.9,
+        line_half_width::Real = 15000.0,
+        v_center::Real = 0.0
+    ) where {T<:Real}
+
+    continuum = zeros{T}(size(ccfs)[2:end])
+    @info size(continuum)
+    for ord in 1:size(ccfs,3)
+        for obs in 1:size(ccfs,2)
+            continuum[ord,obs] = estimate_continuum(v_grid, view(ccfs, :, ord, obs);
+                                    quantile_level, line_half_width, v_center)
+        end
+    end
+    return continuum
+end
+
+"""
     svd_reconstruction(ccf; n=size(ccf,2)) -> Matrix
 
 Reconstruct a CCF matrix using only the leading `n` singular value components.

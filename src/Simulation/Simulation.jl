@@ -33,7 +33,7 @@ const days_in_year = 365.2425
 const c_mps        = 299_792_458.0
 
 include("models.jl")
-include("gasusshermite.jl")
+include("gausshermite.jl")
 include("data_generation.jl")
 
 end # module Simulation

@@ -347,11 +347,15 @@ function vscalpels_recover_loocv(
     vperp = pperp * rv_centered
 
     # Weighted least-squares for Keplerian amplitudes.
-    invar = Diagonal(σ_rv.^(-2))
-    amat  = (fperp' * invar) * fperp
-    bvec  = (fperp' * invar) * vperp
-    theta    = amat \ bvec
-    theterr  = sqrt.(diag(inv(amat)))
+    # pinv is used instead of \ and inv to handle singular amat, which can
+    # occur when a trial period is commensurate with the observation baseline
+    # or when the activity projector absorbs a sinusoidal direction.
+    invar     = Diagonal(σ_rv.^(-2))
+    amat      = (fperp' * invar) * fperp
+    bvec      = (fperp' * invar) * vperp
+    amat_pinv = pinv(amat)
+    theta     = amat_pinv * bvec
+    theterr   = sqrt.(max.(0.0, diag(amat_pinv)))
 
     # Convert (cos, sin) amplitudes to velocity semi-amplitudes.
     amp    = Vector{Float64}(undef, nplanets)
@@ -394,4 +398,168 @@ function vscalpels_recover_loocv(
         kwargs...
     )
     vscalpels_recover_loocv(bjd, rvs, σ_rv, ccfs, [period]; kwargs...)
+end
+
+"""
+    fit_planets_loocv(bjd, rvs, σ_rv, ccfs, periods;
+                      k_search, max_num_basis=16,
+                      resort=false, jitter=0.0,
+                      weighted_mean=true) -> NamedTuple
+
+Fit a fixed list of planetary periods jointly with stellar activity using
+LOOCV-based SCALPELS. Performs the full three-step pipeline:
+
+1. **Initial fit** — `vscalpels_recover_loocv` at `k_search` activity vectors.
+2. **k optimisation** — `rms_clean_rvs_with_planets_vs_num_basis_scalpels`
+   sweeps from 0 to `max_num_basis` vectors; `k_opt` is chosen by minimum AIC.
+3. **Final fit** — `vscalpels_recover_loocv` at `k_opt` vectors.
+
+This function can be called directly with user-supplied periods or is used
+internally by [`search_planets_loocv`](@ref) after the period search step.
+
+Returns a NamedTuple with fields:
+- `periods`: input period list (days).
+- `k_search`: number of activity vectors used in the initial fit.
+- `k_opt`: optimal number of activity vectors selected by AIC.
+- `init_fit`: full output of `vscalpels_recover_loocv` at `k_search`.
+- `sweep`: full output of `rms_clean_rvs_with_planets_vs_num_basis_scalpels`.
+- `final_fit`: full output of `vscalpels_recover_loocv` at `k_opt`.
+
+# Arguments
+- `bjd`: Observation times (days).
+- `rvs`: Observed RVs (m/s).
+- `σ_rv`: RV uncertainties (m/s).
+- `ccfs`: CCF matrix, size `(num_vel_bins, num_obs)`.
+- `periods`: Vector of orbital periods to fit simultaneously (days).
+
+# Keyword Arguments
+- `k_search`: Activity vectors for the initial fit; should be ≥ 1.
+- `max_num_basis`: Upper bound on the k sweep (default 16).
+- `resort`, `jitter`, `weighted_mean`: passed to `vscalpels_recover_loocv`.
+"""
+function fit_planets_loocv(
+        bjd::AbstractVector{<:Real},
+        rvs::AbstractVector{<:Real},
+        σ_rv::AbstractVector{<:Real},
+        ccfs::AbstractMatrix{<:Real},
+        periods::AbstractVector{<:Real};
+        k_search::Integer,
+        max_num_basis::Integer = 16,
+        resort::Bool = false,
+        jitter::Real = 0.0,
+        weighted_mean::Bool = true
+    )
+    # Step 1: initial fit at k_search vectors.
+    init_fit = vscalpels_recover_loocv(
+        bjd, rvs, σ_rv, ccfs, periods;
+        max_scalpels_vectors = k_search,
+        resort, jitter, weighted_mean
+    )
+
+    # Step 2: sweep k from 0 to max_num_basis and select by AIC.
+    sweep = rms_clean_rvs_with_planets_vs_num_basis_scalpels(
+        bjd, rvs, ccfs, periods;
+        σ_rvs         = σ_rv,
+        min_num_basis = 0,
+        max_num_basis = max_num_basis,
+        resort        = false,
+        weighted_mean,
+    )
+    k_opt = sweep.num_basis[argmin(sweep.aic)]
+
+    # Step 3: final fit at k_opt.
+    final_fit = vscalpels_recover_loocv(
+        bjd, rvs, σ_rv, ccfs, periods;
+        max_scalpels_vectors = max(1, k_opt),
+        resort, jitter, weighted_mean
+    )
+
+    return (; periods = collect(periods), k_search, k_opt, init_fit, sweep, final_fit)
+end
+
+"""
+    search_planets_loocv(bjd, rvs, σ_rv, ccfs, period_list;
+                         max_num_pl=3, k_search,
+                         max_num_basis=16, resort=false,
+                         jitter=0.0, weighted_mean=true) -> NamedTuple
+
+Greedily search for up to `max_num_pl` planets using LOOCV-based SCALPELS,
+then fit each cumulative period list with [`fit_planets_loocv`](@ref).
+
+For each planet count `num_pl` from 1 to `max_num_pl`:
+1. **Period scan** — call `vscalpels_recover_loocv` at `k_search` vectors for
+   every trial period in `period_list` (with previously found periods fixed),
+   retaining the full output at each point for diagnostics.
+2. **Best period selection** — choose the trial period minimising χ².
+3. **Full fit** — call [`fit_planets_loocv`](@ref) with the accumulated period
+   list; this runs the initial fit, k sweep, and final fit.
+
+Returns a NamedTuple `(; results)` where `results` is a `Vector` of
+NamedTuples (one per `num_pl`) with fields:
+- `period_list`: trial periods scanned at this step.
+- `search_outs`: `Vector` of full `vscalpels_recover_loocv` outputs (one per
+  trial period) — contains all fields including `χ²`, `amp`, `rvresid`, etc.
+- `fit_result`: output of `fit_planets_loocv` for the chosen periods —
+  contains `periods`, `k_search`, `k_opt`, `init_fit`, `sweep`, `final_fit`.
+
+# Arguments
+- `bjd`: Observation times (days).
+- `rvs`: Observed RVs (m/s).
+- `σ_rv`: RV uncertainties (m/s).
+- `ccfs`: CCF matrix, size `(num_vel_bins, num_obs)`.
+- `period_list`: Vector of trial periods (days) to scan at each step.
+
+# Keyword Arguments
+- `max_num_pl`: Number of planets to search for (default 3).
+- `k_search`: Activity vectors used during the period scan; passed to
+  `fit_planets_loocv` as well. Should be ≥ 1.
+- `max_num_basis`: Upper bound on the k sweep in `fit_planets_loocv` (default 16).
+- `resort`, `jitter`, `weighted_mean`: passed through to underlying calls.
+"""
+function search_planets_loocv(
+        bjd::AbstractVector{<:Real},
+        rvs::AbstractVector{<:Real},
+        σ_rv::AbstractVector{<:Real},
+        ccfs::AbstractMatrix{<:Real},
+        period_list::AbstractVector{<:Real};
+        max_num_pl::Integer = 3,
+        k_search::Integer,
+        max_num_basis::Integer = 16,
+        resort::Bool = false,
+        jitter::Real = 0.0,
+        weighted_mean::Bool = true
+    )
+    best_periods = Float64[]
+    results = NamedTuple[]
+
+    for num_pl in 1:max_num_pl
+
+        # Step 1: scan the period grid, storing full vscalpels_recover_loocv
+        # output at every trial period for downstream diagnostics.
+        search_outs = map(period_list) do P
+            vscalpels_recover_loocv(
+                bjd, rvs, σ_rv, ccfs, vcat(best_periods, [P]);
+                max_scalpels_vectors = k_search,
+                resort, jitter, weighted_mean
+            )
+        end
+
+        # Step 2: pick the period with the lowest χ².
+        best_P = period_list[argmin([out.χ² for out in search_outs])]
+        push!(best_periods, best_P)
+
+        # Step 3: full fit (initial + k sweep + final) for the accumulated periods.
+        fit_result = fit_planets_loocv(
+            bjd, rvs, σ_rv, ccfs, copy(best_periods);
+            k_search, max_num_basis, resort, jitter, weighted_mean
+        )
+
+        push!(results, (;
+            period_list = collect(period_list),
+            search_outs,
+            fit_result,
+        ))
+    end
+
+    return (; results)
 end

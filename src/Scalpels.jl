@@ -26,16 +26,21 @@ using LinearAlgebra
 export clean_rvs_scalpels,
        calc_basis_scores_scalpels,
        rms_clean_rvs_vs_num_basis_scalpels,
+       rms_clean_rvs_with_planets_vs_num_basis_scalpels,
        loocv,
        reorder_uloocv,
        vscalpels_loocv,
        vscalpels_recover_loocv,
+       fit_planets_loocv,
+       search_planets_loocv,
        mask_outliers,
        quality_control,
        make_period_list,
-       svd_reconstruction
+       svd_reconstruction,
+       estimate_continuum
 
 include("internals.jl")
+include("scalpels_code.jl")
 include("original.jl")
 include("loocv.jl")
 include("diagnostics.jl")

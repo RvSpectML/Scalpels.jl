@@ -112,7 +112,7 @@ function quality_control(
     scalpels_out = vscalpels_loocv(
         ccfs_clean, rvs_clean, σrvs_clean;
         max_scalpels_vectors,
-        resort = false
+        resort = false, weighted_mean=false
     )
     h = scalpels_out.u_loocv
     d = view(svd_out.U, :, 1:max_scalpels_vectors).- h
