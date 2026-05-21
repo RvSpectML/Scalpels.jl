@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v0.20.25
+# v0.20.27
 
 using Markdown
 using InteractiveUtils
@@ -50,7 +50,7 @@ md"## 1. Configuration"
 # ╔═╡ 20000002-0000-0000-0000-000000000002
 # Data directory: first ARGS element when run as a script; default inside Pluto.
 data_dir = if isdefined(Main, :PlutoRunner)
-joinpath(@__DIR__, "..", "data", "DS8")
+joinpath(@__DIR__, "..", "data", "DS2")
 else
 isempty(ARGS) ? joinpath(@__DIR__, "..", "data", "DS1") : first(ARGS)
 end
@@ -60,9 +60,10 @@ begin
 Pmin              = 2.0    # Minimum trial period (days)
 Pmax              = 200.0  # Maximum trial period (days)
 oversample_factor = 4.0    # Frequency grid oversampling factor
-max_num_basis     = 8      # Maximum SCALPELS feature vectors to test
+max_num_basis     = 4      # Maximum SCALPELS feature vectors to test
 max_num_pl        = 3      # Maximum number of planets to model
 run_analysis      = true   # Set false to skip the expensive period search
+use_rms_weights   = true   # true → 1/std(rv_order)² weights; false → CSV order weights
 end;
 
 # ╔═╡ 20000004-0000-0000-0000-000000000004
@@ -78,7 +79,7 @@ known_instrument_offsets = Dict{String, Float64}(
 # ╔═╡ 20000005-0000-0000-0000-000000000005
 # true  → subtract known_instrument_offsets per instrument
 # false → subtract per-instrument inverse-variance weighted mean from data
-use_fixed_offsets = true;
+use_fixed_offsets = false;
 
 # ╔═╡ 30000001-0000-0000-0000-000000000001
 md"## 2. Helper Functions"
@@ -139,9 +140,14 @@ end
 """
 Load and combine all CCF FITS files, applying continuum normalisation and
 order weighting. Returns a vector of NamedTuples sorted by the call-site.
+
+When `rms_weights_by_inst` is provided (a Dict from `compute_obo_rv_rms`),
+per-order inverse-variance weights (1/std(rv_order)²) are used for both
+the CCF and RV combination. Otherwise the CSV `order_weights` table is used.
 """
 function load_obs_data(ccf_files, stem_to_meta, order_weights;
-                       max_obs::Integer = typemax(Int))
+                       max_obs::Integer = typemax(Int),
+                       rms_weights_by_inst = nothing)
 rows = NamedTuple[]
 for path in ccf_files[1:min(max_obs, length(ccf_files))]
 base = splitext(basename(path))[1]
@@ -163,12 +169,18 @@ d.obo_ccf[nan_mask] .= NaN
 d.obo_ccf   ./= ccf_norm'
 d.obo_e_ccf ./= ccf_norm'
 
-# Per-order weights: zero out orders with any NaN in the CCF
-weight_idx = map(i -> searchsortedfirst(order_weights[!, "echelle"],
-                                       d.orders[i], rev=true),
-                1:length(d.orders))
-order_weights[ismissing.(order_weights[!, meta.inst]),meta.inst] .= 0.0
-w = Float64.(order_weights[weight_idx, meta.inst])
+# Per-order weights
+if rms_weights_by_inst !== nothing && haskey(rms_weights_by_inst, meta.inst)
+    stats   = rms_weights_by_inst[meta.inst]
+    rms_map = Dict(stats.orders[i] => stats.inv_var[i] for i in 1:length(stats.orders))
+    w = [get(rms_map, d.orders[i], 0.0) for i in 1:length(d.orders)]
+else
+    weight_idx = map(i -> searchsortedfirst(order_weights[!, "echelle"],
+                                           d.orders[i], rev=true),
+                    1:length(d.orders))
+    order_weights[ismissing.(order_weights[!, meta.inst]), meta.inst] .= 0.0
+    w = Float64.(order_weights[weight_idx, meta.inst])
+end
 w[vec(any(isnan.(d.obo_ccf), dims=1))] .= 0.0
 
 (ccf_combo, _)    = combine_orders_ccf(d.obo_ccf, w)
@@ -211,6 +223,57 @@ rv .-= sum(rv .* invar) / sum(invar)  # global re-centering
 return rv
 end
 
+# ╔═╡ 35000001-0000-0000-0000-000000000001
+"""
+Compute per-order temporal std(RV) and inverse-variance weights per instrument.
+
+Reads only `OBO_RV` and `ECHELLE_ORDERS` from each FITS file. Returns a Dict
+mapping instrument → `(; orders, rms_rv, inv_var)` where `inv_var[i]` is
+`1/std(rv_order[i])²` (0.0 for orders with fewer than 2 valid epochs or NaN std).
+"""
+function compute_obo_rv_rms(ccf_files, df_ts)
+    stem_meta = Dict(
+        match(r"DS\d\.\d+", row["Standard File Name"]).match => (inst = row.Instrument,)
+        for row in eachrow(df_ts)
+    )
+
+    inst_rv_lists  = Dict{String, Vector{Vector{Float64}}}()
+    inst_order_ref = Dict{String, Vector{Int}}()
+
+    for path in ccf_files
+        base = splitext(basename(path))[1]
+        m    = match(r"DS\d\.\d+", base)
+        m === nothing && continue
+        stem = m.match
+        meta = get(stem_meta, stem, nothing)
+        meta === nothing && continue
+
+        obo_rv, orders = FITS(path) do f
+            Float64.(read(f["OBO_RV"])), read(f["ECHELLE_ORDERS"])
+        end
+
+        inst = meta.inst
+        if !haskey(inst_rv_lists, inst)
+            inst_rv_lists[inst]  = Vector{Float64}[]
+            inst_order_ref[inst] = orders
+        end
+        push!(inst_rv_lists[inst], obo_rv)
+    end
+
+    return Dict(
+        inst => begin
+            rvmat  = stack(rvlist)
+            rms_rv = [begin
+                v = filter(!isnan, view(rvmat, i, :))
+                length(v) >= 2 ? std(v) : NaN
+            end for i in 1:size(rvmat, 1)]
+            inv_var = [(isnan(r) || r <= 0.0) ? 0.0 : 1.0 / r^2 for r in rms_rv]
+            (; orders = inst_order_ref[inst], rms_rv, inv_var)
+        end
+        for (inst, rvlist) in inst_rv_lists
+    )
+end
+
 # ╔═╡ 40000001-0000-0000-0000-000000000001
 md"## 3. File Discovery"
 
@@ -235,6 +298,11 @@ md"## 4. Load Data"
 # ╔═╡ 50000002-0000-0000-0000-000000000002
 df_ts = load_time_series(csv_path);
 
+# ╔═╡ 50000007-0000-0000-0000-000000000007
+# Compute per-order temporal std(RV) per instrument for inverse-variance weighting.
+# Only executed when use_rms_weights = true; otherwise skipped (nothing).
+obo_rv_stats = use_rms_weights ? compute_obo_rv_rms(ccf_files, df_ts) : nothing;
+
 # ╔═╡ 50000003-0000-0000-0000-000000000003
 stem_to_meta = Dict(
 row.stem => (t = row["Time [eMJD]"], inst = row.Instrument)
@@ -245,7 +313,8 @@ for row in eachrow(df_ts)
 order_weights = CSV.read(order_weights_path, DataFrame);
 
 # ╔═╡ 50000005-0000-0000-0000-000000000005
-obs_data = load_obs_data(ccf_files, stem_to_meta, order_weights);
+obs_data = load_obs_data(ccf_files, stem_to_meta, order_weights;
+                         rms_weights_by_inst = obo_rv_stats);
 
 # ╔═╡ 50000006-0000-0000-0000-000000000006
 begin
@@ -338,34 +407,34 @@ the cleaned RVs.
 
 # ╔═╡ e268dc8d-f9bc-42c2-9bf9-10d800f73c40
 results_0pl = Dict(
-    inst => let d = inst_data[inst]      
+    inst => let d = inst_data[inst]
         invar       = 1.0 ./ d.σrvs.^2
         rv_centered = d.rvs .- mean(d.rvs, weights(invar))
         loocv_out   = loocv(rv_centered, d.ccfs;
                             σ_rvs = d.σrvs,
-                            max_scalpels_vectors = max_num_basis)    
-        u, α = loocv_out.u_loocv, loocv_out.α_loocv                                  
-        idx_perm = 1:max_num_basis                                                   
+                            max_scalpels_vectors = max_num_basis)
+        u, α = loocv_out.u_loocv, loocv_out.α_loocv
+        idx_perm = 1:max_num_basis
 		idx_perm, _, aic_list, _ = reorder_uloocv(
             u, α, rv_centered, d.σrvs;
             max_scalpels_vectors = max_num_basis
         )
-        u_ord = u[:, idx_perm]                                                       
-        α_ord = α[:, idx_perm]                           
-        aic_sweep = aic_zero_planet_vs_num_basis_loocv(u_ord, α_ord, rv_centered, d.σrvs)                                                      
+        u_ord = u[:, idx_perm]
+        α_ord = α[:, idx_perm]
+        aic_sweep = aic_zero_planet_vs_num_basis_loocv(u_ord, α_ord, rv_centered, d.σrvs)
         k_0       = 3 # aic_sweep.num_basis[argmin(aic_sweep.aic)]
-		rv_clean  = if k_0 == 0                                                      
-            			rv_centered                                                  
-        			else                            
+		rv_clean  = if k_0 == 0
+            			rv_centered
+        			else
             			rv_shape = sum(view(u_ord, :, 1:k_0) .* view(α_ord, :, 1:k_0), dims=2)
             			vec(rv_centered .- rv_shape)
 					end
         rms_sweep = aic_sweep.rms
         u_loocv   = k_0 > 0 ? u_ord[:, 1:k_0] : zeros(length(rv_centered), 0)
-        α_loocv   = k_0 > 0 ? α_ord[:, 1:k_0] : zeros(length(rv_centered), 0)        
+        α_loocv   = k_0 > 0 ? α_ord[:, 1:k_0] : zeros(length(rv_centered), 0)
         (; aic_sweep, k_0, rv_clean, rms_sweep, u_loocv, α_loocv)
-    end                                                                              
-    for inst in instruments                              
+    end
+    for inst in instruments
   );
 
 # ╔═╡ 80000004-0000-0000-0000-000000000004
@@ -564,31 +633,31 @@ begin
 end
 
 # ╔═╡ 65d6b218-8a99-4df5-a2a8-0db3531e3b2f
- let                                                                                 
+ let
   dfs = map(instruments) do inst
-      d     = inst_data[inst]                                                        
-      r     = results_0pl[inst]                          
-      invar = 1.0 ./ d.σrvs.^2                                                       
+      d     = inst_data[inst]
+      r     = results_0pl[inst]
+      invar = 1.0 ./ d.σrvs.^2
       rv_raw   = d.rvs .- mean(d.rvs, weights(invar))
-      rv_clean = r.rv_clean .- mean(r.rv_clean, weights(invar))                      
-      df = DataFrame(                                                                
-          instrument = fill(inst, length(d.t)),                                      
-          t          = d.t,                                                          
-          rv_obs     = rv_raw,                           
-          rv_clean   = rv_clean,                                                    
-          rv_orbit   = zeros(length(d.t)),               
-          rv_resid   = rv_clean,                                                    
+      rv_clean = r.rv_clean .- mean(r.rv_clean, weights(invar))
+      df = DataFrame(
+          instrument = fill(inst, length(d.t)),
+          t          = d.t,
+          rv_obs     = rv_raw,
+          rv_clean   = rv_clean,
+          rv_orbit   = zeros(length(d.t)),
+          rv_resid   = rv_clean,
           sigma_rv   = d.σrvs,
-      )                                                                                                                                        
-      for k in 1:r.k_0                                                              
+      )
+      for k in 1:r.k_0
           df[!, "shape_score_$k"] = r.u_loocv[:, k]
-          df[!, "rv_score_$k"]    = r.α_loocv[:, k]                                 
-      end                                                                           
-      df                                 
-  end                                                                                                                                          
+          df[!, "rv_score_$k"]    = r.α_loocv[:, k]
+      end
+      df
+  end
   df = sort(vcat(dfs...; cols = :union), [:instrument, :t])
-  CSV.write(joinpath(results_dir, "results_0pl.csv"), df)                            
-  md"Saved `results_0pl.csv` ($(nrow(df)) rows, $(ncol(df)) columns)."               
+  CSV.write(joinpath(results_dir, "results_0pl.csv"), df)
+  md"Saved `results_0pl.csv` ($(nrow(df)) rows, $(ncol(df)) columns)."
   end
 
 # ╔═╡ f795600d-f744-45e2-b805-b21ace067d6d
@@ -597,28 +666,28 @@ end
   for num_pl in 1:max_num_pl
       dfs = map(enumerate(instruments)) do (i, inst)
           fr  = planet_results.results[num_pl].fit_results[i]
-          f   = fr.final_fit                                                                                                                   
-          d   = inst_data[inst]          
-          df  = DataFrame(                                                                                                                     
-              instrument = fill(inst, length(d.t)),      
-              t          = d.t,                                                                                                                
+          f   = fr.final_fit
+          d   = inst_data[inst]
+          df  = DataFrame(
+              instrument = fill(inst, length(d.t)),
+              t          = d.t,
               rv_obs     = d.rvs .- mean(d.rvs),
-              rv_clean   = vec(f.rvclean),                                                                                                     
-              rv_orbit   = vec(f.rvorbit),               
-              rv_resid   = vec(f.rvresid),                                                                                                     
+              rv_clean   = vec(f.rvclean),
+              rv_orbit   = vec(f.rvorbit),
+              rv_resid   = vec(f.rvresid),
               sigma_rv   = d.σrvs,
-          )                                                                                                                                    
-          for k in 1:size(f.u_loocv, 2)                  
-              df[!, "shape_score_$k"] = f.u_loocv[:, k]                                                                                        
+          )
+          for k in 1:size(f.u_loocv, 2)
+              df[!, "shape_score_$k"] = f.u_loocv[:, k]
               df[!, "rv_score_$k"]    = f.α_loocv[:, k]
-          end                                                                                                                                  
-          df                                             
-      end                                                                                                                                      
+          end
+          df
+      end
       df = sort(vcat(dfs...; cols = :union), [:instrument, :t])
       CSV.write(joinpath(results_dir, "results_$(num_pl)pl.csv"), df)
-  end                                                                                                                                          
+  end
   md"Saved `results_1pl.csv` … `results_$(max_num_pl)pl.csv`."
-  end                                                                                
+  end
 
 # ╔═╡ b0000005-0000-0000-0000-000000000005
 let
@@ -668,28 +737,28 @@ maybe_savefig(fig0, joinpath(data_dir, "results", "plot_0pl_rms.png"))
 end
 
 # ╔═╡ fb225623-1b50-4679-8eaf-397421b0ecfc
- # 80000003b-0000-0000-0000-000000000000                                                                                                  
-  let                                                                                                                                          
-  ninst = length(instruments)                                                                                                                  
-  plts  = map(instruments) do inst                                                                                                             
-      r  = results_0pl[inst]                                                                                                                   
-      ks = collect(r.aic_sweep.num_basis)                                                                                                      
-                                                                                                                                               
-      p_aic = plot(ks, r.aic_sweep.aic;                                                                                                        
-                   marker = :circle, ms = 3, lw = 1.5,                                                                                         
-                   xlabel = "Number of feature vectors", ylabel = "AIC",                                                                       
-                   title  = "$inst — AIC", legend = false)                                                                                     
-      vline!(p_aic, [r.k_0]; ls = :dash, lw = 1.5, lc = :red,                                                                                  
-             label = "k₀ = $(r.k_0)")                                                                                                          
-                                                                                                                                               
-      p_rms = plot(ks, r.aic_sweep.rms;                                                                                                        
-                   marker = :circle, ms = 3, lw = 1.5,                                                                                         
-                   xlabel = "Number of feature vectors", ylabel = "RMS (m/s)",                                                                 
-                   title  = "$inst — RMS", legend = false)                                                                                     
-      vline!(p_rms, [r.k_0]; ls = :dash, lw = 1.5, lc = :red,                                                                                  
-             label = "k₀ = $(r.k_0)")                    
-                                         
-      (p_aic, p_rms)                                                                                                                           
+ # 80000003b-0000-0000-0000-000000000000
+  let
+  ninst = length(instruments)
+  plts  = map(instruments) do inst
+      r  = results_0pl[inst]
+      ks = collect(r.aic_sweep.num_basis)
+
+      p_aic = plot(ks, r.aic_sweep.aic;
+                   marker = :circle, ms = 3, lw = 1.5,
+                   xlabel = "Number of feature vectors", ylabel = "AIC",
+                   title  = "$inst — AIC", legend = false)
+      vline!(p_aic, [r.k_0]; ls = :dash, lw = 1.5, lc = :red,
+             label = "k₀ = $(r.k_0)")
+
+      p_rms = plot(ks, r.aic_sweep.rms;
+                   marker = :circle, ms = 3, lw = 1.5,
+                   xlabel = "Number of feature vectors", ylabel = "RMS (m/s)",
+                   title  = "$inst — RMS", legend = false)
+      vline!(p_rms, [r.k_0]; ls = :dash, lw = 1.5, lc = :red,
+             label = "k₀ = $(r.k_0)")
+
+      (p_aic, p_rms)
   end
   fig = plot(Iterators.flatten(plts)...;
        layout = (ninst, 2),
@@ -751,9 +820,9 @@ let
 end
 
 # ╔═╡ 728e1bb4-8ecd-43ff-a36a-14b03853542e
-# 91000005-0000-0000-0000-000000000000 
-let  # AIC and RMS vs. feature vectors — 1-planet model                                                             
-  if run_analysis                                                                                                                              
+# 91000005-0000-0000-0000-000000000000
+let  # AIC and RMS vs. feature vectors — 1-planet model
+  if run_analysis
   ninst = length(instruments)
   plts  = map(enumerate(instruments)) do (i, inst)
       fr  = planet_results.results[1].fit_results[i]
@@ -841,8 +910,8 @@ end
 # ╔═╡ 27432d4a-66da-4aef-b6e5-848d0473a7c6
 # 92000005-0000-0000-0000-000000000000
 let
-  # AIC and RMS vs. feature vectors — 2-planet model     
-  if run_analysis && max_num_pl >= 2                                                                                                           
+  # AIC and RMS vs. feature vectors — 2-planet model
+  if run_analysis && max_num_pl >= 2
   ninst = length(instruments)
   plts  = map(enumerate(instruments)) do (i, inst)
       fr  = planet_results.results[2].fit_results[i]
@@ -907,7 +976,7 @@ end
 # ╔═╡ 80582cde-c823-4e5a-bc88-80348ddcaee6
 # Amplitude periodogram — 3rd-planet search, all instruments
 let
-  if run_analysis && max_num_pl >= 3                                                 
+  if run_analysis && max_num_pl >= 3
   res3    = planet_results.results[3]
   lp3     = log10.(res3.period_list)
   best_P3 = res3.fit_results[1].periods[3]
@@ -929,8 +998,8 @@ end
 # ╔═╡ 37b0e6f9-8cd4-4f88-abed-8f35e9aa33df
 # 93000005-0000-0000-0000-000000000000
 let
-  # AIC and RMS vs. feature vectors — 3-planet model     
-  if run_analysis && max_num_pl >= 3                                                                                                           
+  # AIC and RMS vs. feature vectors — 3-planet model
+  if run_analysis && max_num_pl >= 3
   ninst = length(instruments)
   plts  = map(enumerate(instruments)) do (i, inst)
       fr  = planet_results.results[3].fit_results[i]
@@ -951,7 +1020,7 @@ let
              label = "k_opt = $(fr.k_opt)")
 
       (p_aic, p_rms)
-  end                                                    
+  end
   fig3c = plot(Iterators.flatten(plts)...;
        layout = (ninst, 2),
        size   = (800, 220 * ninst))
@@ -975,10 +1044,12 @@ end
 # ╟─30000005-0000-0000-0000-000000000005
 # ╠═30000006-0000-0000-0000-000000000006
 # ╟─30000007-0000-0000-0000-000000000007
+# ╟─35000001-0000-0000-0000-000000000001
 # ╟─40000001-0000-0000-0000-000000000001
 # ╟─40000002-0000-0000-0000-000000000002
 # ╟─50000001-0000-0000-0000-000000000001
 # ╠═50000002-0000-0000-0000-000000000002
+# ╠═50000007-0000-0000-0000-000000000007
 # ╠═50000003-0000-0000-0000-000000000003
 # ╠═50000004-0000-0000-0000-000000000004
 # ╠═50000005-0000-0000-0000-000000000005

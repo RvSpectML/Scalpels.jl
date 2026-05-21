@@ -70,7 +70,8 @@ function estimate_continuum(
     @assert length(v_grid) == length(ccf)
     mask = abs.(v_grid .- v_center) .>= line_half_width
     @assert any(mask) "line_half_width=$line_half_width excludes all velocity bins; reduce it"
-    return mean(view(ccf, mask)) #, quantile_level)
+    #return mean(view(ccf, mask)) #, quantile_level)
+    return quantile(view(ccf, mask), quantile_level)
 end
 
 """
