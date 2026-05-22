@@ -214,7 +214,8 @@ function vscalpels_loocv(
     )
 
     kmax = max_scalpels_vectors
-    rv_centered = rv.- mean(rv)
+    mean_rv = mean(rv)
+    rv_centered = rv.- mean_rv
 
     α_loocv, u_loocv = loocv(
         rv_centered, ccfs;
@@ -223,11 +224,12 @@ function vscalpels_loocv(
     )
 
     if resort
-        idx_perm, _, aic_list, _ = reorder_uloocv(
+        idx_perm, _, aic_list, rms_list = reorder_uloocv(
             u_loocv, α_loocv, rv_centered, σ_rv;
             jitter, max_scalpels_vectors
         )
-        kmax     = argmin(aic_list)
+        #kmax     = argmin(aic_list)
+        kmax     = argmin(rms_list)
         α_loocv  = α_loocv[:, idx_perm[1:kmax-1]]
         u_loocv  = u_loocv[:, idx_perm[1:kmax-1]]
     else
@@ -237,7 +239,7 @@ function vscalpels_loocv(
 
     v_resp   = u_loocv.* α_loocv
     rv_shape = sum(v_resp, dims=2)
-    rv_clean = vec(rv_centered.- rv_shape)
+    rv_clean = vec(rv_centered.- rv_shape) .+ mean_rv
 
     return (; rv_clean, u_loocv, α_loocv)
 end
@@ -282,6 +284,8 @@ Returns a named tuple with fields:
 - `jitter`: Additional jitter (m/s) added in quadrature to `σ_rv`.
 - `weighted_mean`: If `true` (default), use inverse-variance weighted mean
   ACF subtraction inside [`loocv`](@ref).
+- `mean_bjd`: Reference epoch (days) used as the time zero-point when
+  building the sinusoidal design matrix. Defaults to `mean(bjd)`.
 
 # Extended help
 
@@ -299,14 +303,15 @@ function vscalpels_recover_loocv(
         max_scalpels_vectors::Integer = calc_max_vectors(ccfs),
         resort::Bool = true,
         jitter::Real = 0.0,
-        weighted_mean::Bool = true
+        weighted_mean::Bool = true,
+        mean_bjd::Real = mean(bjd)
     )
 
     @assert max_scalpels_vectors >= 0
     kmax = max_scalpels_vectors
     nobs = length(bjd)
-    mean_bjd   = mean(bjd)
-    rv_centered = rvs.- mean(rvs)
+    mean_rv = mean(rvs)
+    rv_centered = rvs .- mean_rv
 
     loocv_out = loocv(
         rv_centered, ccfs;
@@ -317,12 +322,13 @@ function vscalpels_recover_loocv(
     α_loocv = loocv_out.α_loocv
 
     if resort
-        idx_perm, χ²_list, aic_list, _ = reorder_uloocv(
+        idx_perm, χ²_list, aic_list, rms_list = reorder_uloocv(
             u_loocv, α_loocv, rv_centered, σ_rv;
             jitter, max_scalpels_vectors
         )
         if max_scalpels_vectors > 0
-            kmax    = argmin(aic_list)
+            #kmax    = argmin(aic_list)
+            kmax    = argmin(rms_list)
             α_loocv = α_loocv[:, idx_perm[1:kmax-1]]
             u_loocv = u_loocv[:, idx_perm[1:kmax-1]]
         end
@@ -330,12 +336,13 @@ function vscalpels_recover_loocv(
 
     # Build sinusoidal design matrix for all trial periods.
     nplanets = length(periods)
-    fftrn = Matrix{Float64}(undef, nobs, 2 * nplanets)
+    fftrn = Matrix{Float64}(undef, nobs, 2 * nplanets + 1)
     for planet in 1:nplanets
         phi = 2π / periods[planet].* (bjd.- mean_bjd)
         fftrn[:, 2*planet-1] = cos.(phi)
         fftrn[:, 2*planet]   = sin.(phi)
     end
+    fftrn[:, 2*nplanets+1] .= 1.0
 
     # Projection operator onto the complement of the activity subspace.
     pperp = I(nobs)
@@ -358,27 +365,40 @@ function vscalpels_recover_loocv(
     theterr   = sqrt.(max.(0.0, diag(amat_pinv)))
 
     # Convert (cos, sin) amplitudes to velocity semi-amplitudes.
+    Kx     = Vector{Float64}(undef, nplanets)
+    Ky     = Vector{Float64}(undef, nplanets)
+    dKx    = Vector{Float64}(undef, nplanets)
+    dKy    =  Vector{Float64}(undef, nplanets)
     amp    = Vector{Float64}(undef, nplanets)
     amperr = Vector{Float64}(undef, nplanets)
+    phase  = Vector{Float64}(undef, nplanets)
+    phaseerr = Vector{Float64}(undef, nplanets)
+    t0 = Vector{Float64}(undef, nplanets)
     for planet in 1:nplanets
         icol = 2 * planet - 1
-        Kx, dKx = theta[icol],   theterr[icol]
-        Ky, dKy = theta[icol+1], theterr[icol+1]
-        K  = sqrt(Kx^2 + Ky^2)
-        dK = sqrt((Kx * dKx)^2 + (Ky * dKy)^2) / K
+        Kx[planet], dKx[planet] = theta[icol],   theterr[icol]
+        Ky[planet], dKy[planet] = theta[icol+1], theterr[icol+1]
+        K  = sqrt(Kx[planet]^2 + Ky[planet]^2)
+        dK = sqrt((Kx[planet] * dKx[planet])^2 + (Ky[planet] * dKy[planet])^2) / K
         amp[planet]    = K
         amperr[planet] = dK
+        phase[planet]  = rad2deg(atan(Ky[planet], Kx[planet]))
+        phaseerr[planet] = rad2deg(sqrt(Ky[planet]^2*dKx[planet]^2+Kx[planet]^2*dKy[planet]^2)/(Kx[planet]^2+Ky[planet]^2))
+        t0 = mean_bjd + periods[planet]/(2π) * phase[planet]
     end
-
+    C = last(theta)
+    Cerr = last(theterr)
+ 
     rvorbit  = fftrn * theta
-    rvclean  = vperp
+    rvclean  = vperp 
     rvshape  = rv_centered.- rvclean
+    #rvclean  .+= mean_rv
     rvresid  = vperp.- fperp * theta
     χ²       = sum(abs2.(rvresid./ σ_rv))
 
     return (;
-        rv_centered, rvshape, rvclean, rvorbit, rvresid,
-        periods, amp, amperr, u_loocv, α_loocv, fftrn, χ²
+        rv_obs=rvs, rvshape, rvclean, rvorbit, rvresid,
+        periods, amp, amperr, Kx, Ky, dKx, dKy, C, Cerr, phase, phaseerr, t0, u_loocv, α_loocv, fftrn, χ²
     )
 end
 
@@ -436,6 +456,8 @@ Returns a NamedTuple with fields:
 - `k_search`: Activity vectors for the initial fit; should be ≥ 1.
 - `max_num_basis`: Upper bound on the k sweep (default 16).
 - `resort`, `jitter`, `weighted_mean`: passed to `vscalpels_recover_loocv`.
+- `mean_bjd`: Reference epoch (days) passed to `vscalpels_recover_loocv`.
+  Defaults to `mean(bjd)`.
 """
 function fit_planets_loocv(
         bjd::AbstractVector{<:Real},
@@ -448,13 +470,14 @@ function fit_planets_loocv(
         resort::Bool = false,
         fixed_k::Bool = false,
         jitter::Real = 0.0,
-        weighted_mean::Bool = true
+        weighted_mean::Bool = true,
+        mean_bjd::Real = mean(bjd)
     )
     # Step 1: initial fit at k_search vectors.
     init_fit = vscalpels_recover_loocv(
         bjd, rvs, σ_rv, ccfs, periods;
         max_scalpels_vectors = k_search,
-        resort, jitter, weighted_mean
+        resort, jitter, weighted_mean, mean_bjd
     )
 
     # Step 2: sweep k from 0 to max_num_basis and select by AIC.
@@ -472,7 +495,7 @@ function fit_planets_loocv(
     final_fit = k_opt == k_search ? init_fit : vscalpels_recover_loocv(
         bjd, rvs, σ_rv, ccfs, periods;
         max_scalpels_vectors = max(1, k_opt),
-        resort, jitter, weighted_mean
+        resort, jitter, weighted_mean, mean_bjd
     )
 
     return (; periods = collect(periods), k_search, k_opt, init_fit, sweep, final_fit)
@@ -522,6 +545,8 @@ NamedTuples (one per `num_pl`) with fields:
   `max(P, P_best) / min(P, P_best) < min_period_ratio` for any `P_best` in the
   accumulated list. Default `1.0` (no filtering).
 - `resort`, `jitter`, `weighted_mean`: passed through to underlying calls.
+- `mean_bjd`: Reference epoch (days) passed to `vscalpels_recover_loocv`
+  and `fit_planets_loocv`. Defaults to `mean(bjd)`.
 """
 function search_planets_loocv(
         bjd::AbstractVector{<:Real},
@@ -536,7 +561,8 @@ function search_planets_loocv(
         resort::Bool = false,
         fixed_k::Bool = false,
         jitter::Real = 0.0,
-        weighted_mean::Bool = true
+        weighted_mean::Bool = true,
+        mean_bjd::Real = mean(bjd)
     )
     best_periods = Float64[]
     results = NamedTuple[]
@@ -554,7 +580,7 @@ function search_planets_loocv(
             vscalpels_recover_loocv(
                 bjd, rvs, σ_rv, ccfs, vcat(best_periods, [P]);
                 max_scalpels_vectors = k_search,
-                resort, jitter, weighted_mean
+                resort, jitter, weighted_mean, mean_bjd
             )
         end
 
@@ -565,7 +591,7 @@ function search_planets_loocv(
         # Step 3: full fit (initial + k sweep + final) for the accumulated periods.
         fit_result = fit_planets_loocv(
             bjd, rvs, σ_rv, ccfs, copy(best_periods);
-            k_search, max_num_basis, resort, fixed_k, jitter, weighted_mean
+            k_search, max_num_basis, resort, fixed_k, jitter, weighted_mean, mean_bjd
         )
 
         push!(results, (;
@@ -623,6 +649,8 @@ NamedTuples (one per `num_pl`) with fields:
   already-found period are skipped (see [`search_planets_loocv`](@ref)).
 - `resort`, `fixed_k`, `jitter`, `weighted_mean`: passed through to underlying
   calls.
+- `mean_bjd`: Reference epoch (days) passed to `vscalpels_recover_loocv` and
+  `fit_planets_loocv`. Defaults to the mean of all BJDs across all instruments.
 """
 function search_planets_loocv_joint(
         inst_data::AbstractVector,
@@ -634,9 +662,12 @@ function search_planets_loocv_joint(
         resort::Bool = false,
         fixed_k::Bool = false,
         jitter::Real = 0.0,
-        weighted_mean::Bool = true
+        weighted_mean::Bool = true,
+        mean_bjd::Union{Real,Nothing} = nothing
     )
     ninst = length(inst_data)
+    actual_mean_bjd::Float64 = isnothing(mean_bjd) ?
+        mean(reduce(vcat, d.bjd for d in inst_data)) : Float64(mean_bjd)
     best_periods = Float64[]
     results = NamedTuple[]
 
@@ -656,7 +687,7 @@ function search_planets_loocv_joint(
                 inst_data[i].bjd, inst_data[i].rvs, inst_data[i].σ_rv,
                 inst_data[i].ccfs, vcat(best_periods, [P]);
                 max_scalpels_vectors = k_search,
-                resort, jitter, weighted_mean
+                resort, jitter, weighted_mean, mean_bjd = actual_mean_bjd
             )
             for P in filtered_period_list, i in 1:ninst
         ]
@@ -672,7 +703,8 @@ function search_planets_loocv_joint(
             fit_planets_loocv(
                 inst_data[i].bjd, inst_data[i].rvs, inst_data[i].σ_rv,
                 inst_data[i].ccfs, copy(best_periods);
-                k_search, max_num_basis, resort, fixed_k, jitter, weighted_mean
+                k_search, max_num_basis, resort, fixed_k, jitter, weighted_mean,
+                mean_bjd = actual_mean_bjd
             )
             for i in 1:ninst
         ]

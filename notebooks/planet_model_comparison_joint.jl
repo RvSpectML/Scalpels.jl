@@ -1,5 +1,5 @@
 ### A Pluto.jl notebook ###
-# v0.20.27
+# v0.20.25
 
 using Markdown
 using InteractiveUtils
@@ -50,7 +50,7 @@ md"## 1. Configuration"
 # ╔═╡ 20000002-0000-0000-0000-000000000002
 # Data directory: first ARGS element when run as a script; default inside Pluto.
 data_dir = if isdefined(Main, :PlutoRunner)
-joinpath(@__DIR__, "..", "data", "DS2")
+joinpath(@__DIR__, "..", "data", "DS3")
 else
 isempty(ARGS) ? joinpath(@__DIR__, "..", "data", "DS1") : first(ARGS)
 end
@@ -122,8 +122,9 @@ bad   = isnan.(rv) .| ismissing.(rv) .| isnan.(weights) .| ismissing.(weights)
 w     = ifelse.(bad, 0.0, Float64.(weights))
 w_sum = sum(w)
 rv_c  = dot(ifelse.(bad, 0.0, Float64.(rv)), w) / w_sum
-inv_var_sum = dot(ifelse.(bad, 0.0, 1.0 ./ Float64.(σrv).^2), w)
-σrv_c = sqrt(w_sum / inv_var_sum)
+#inv_var_sum = dot(ifelse.(bad, 0.0,  Float64.(σrv).^2), w)/ w_sum^2
+#σrv_c = 1/sqrt(inv_var_sum) 
+σrv_c = 1/sqrt(sum(w)) 
 (; rv = rv_c, σrv = σrv_c)
 end
 
@@ -303,6 +304,9 @@ df_ts = load_time_series(csv_path);
 # Only executed when use_rms_weights = true; otherwise skipped (nothing).
 obo_rv_stats = use_rms_weights ? compute_obo_rv_rms(ccf_files, df_ts) : nothing;
 
+# ╔═╡ be979827-99c1-4c98-be9a-911de0cd72ca
+obo_rv_stats
+
 # ╔═╡ 50000003-0000-0000-0000-000000000003
 stem_to_meta = Dict(
 row.stem => (t = row["Time [eMJD]"], inst = row.Instrument)
@@ -415,21 +419,23 @@ results_0pl = Dict(
                             max_scalpels_vectors = max_num_basis)
         u, α = loocv_out.u_loocv, loocv_out.α_loocv
         idx_perm = 1:max_num_basis
+		#=
 		idx_perm, _, aic_list, _ = reorder_uloocv(
             u, α, rv_centered, d.σrvs;
             max_scalpels_vectors = max_num_basis
         )
+		=#
         u_ord = u[:, idx_perm]
         α_ord = α[:, idx_perm]
         aic_sweep = aic_zero_planet_vs_num_basis_loocv(u_ord, α_ord, rv_centered, d.σrvs)
-        k_0       = 3 # aic_sweep.num_basis[argmin(aic_sweep.aic)]
+        rms_sweep = aic_sweep.rms
+        k_0       = aic_sweep.num_basis[argmin(rms_sweep)] #  3 # aic_sweep.num_basis[argmin(aic_sweep.aic)]
 		rv_clean  = if k_0 == 0
             			rv_centered
         			else
             			rv_shape = sum(view(u_ord, :, 1:k_0) .* view(α_ord, :, 1:k_0), dims=2)
             			vec(rv_centered .- rv_shape)
 					end
-        rms_sweep = aic_sweep.rms
         u_loocv   = k_0 > 0 ? u_ord[:, 1:k_0] : zeros(length(rv_centered), 0)
         α_loocv   = k_0 > 0 ? α_ord[:, 1:k_0] : zeros(length(rv_centered), 0)
         (; aic_sweep, k_0, rv_clean, rms_sweep, u_loocv, α_loocv)
@@ -454,9 +460,6 @@ DataFrame(map(instruments) do inst
         frac_var_ccf = round(fv,                     digits = 4),
     )
 end)
-
-# ╔═╡ d13fae7f-cf03-49fc-a85b-7368b06e93b1
-results_0pl["expres"]
 
 # ╔═╡ 90000001-0000-0000-0000-000000000001
 md"""
@@ -485,7 +488,7 @@ planet_results = if run_analysis
         k_search         = k_search_joint,
         min_period_ratio = 1.1,
         max_num_basis    = max_num_basis,
-        resort           = true,
+        resort           = false,
         fixed_k          = true,
     )
 else
@@ -603,6 +606,9 @@ final_summary = DataFrame(map(instruments) do inst
     )
 end);
 
+# ╔═╡ 6b414786-1bef-49d5-b611-809b50f2d778
+planet_results.results[1].fit_results[1].final_fit
+
 # ╔═╡ ed7b8dfc-68b5-4f4a-b973-20e930b0f718
 md"""
 ### Final Summary Table
@@ -632,6 +638,31 @@ begin
 	results_dir
 end
 
+# ╔═╡ eb5eebd0-0cdb-4032-a1c5-0e762d939435
+let
+	for n_pl in 1:3
+	df_out_pl = DataFrame()
+	for inst in 1:length(instruments)	
+		df_tmp = DataFrame(
+	"K [m/s]" => planet_results.results[n_pl].fit_results[inst].final_fit.amp,
+	"P [d]"=>planet_results.results[n_pl].fit_results[inst].final_fit.periods,
+	"t0 [eMJD]" => planet_results.results[n_pl].fit_results[inst].final_fit.phase,
+	"e" => zeros(n_pl),
+	"w [deg]" => zeros(n_pl),
+	"Kx [m/s]" => planet_results.results[n_pl].fit_results[inst].final_fit.Kx,
+	"Ky [m/s]"=>planet_results.results[n_pl].fit_results[inst].final_fit.Ky,
+	"σKx [m/s]" => planet_results.results[n_pl].fit_results[inst].final_fit.dKx,
+	"σKy [m/s]"=>planet_results.results[n_pl].fit_results[inst].final_fit.dKy,
+	"Instrument" => fill(instruments[inst],n_pl))
+		append!(df_out_pl, df_tmp)
+	end
+	sort!(df_out_pl,Symbol("P [d]"))
+	fn = last(split(data_dir,"/")) * "_PSU_Scalpels" * string(n_pl) * "pl_planetFit.csv"
+	CSV.write(joinpath(results_dir, fn), df_out_pl)
+	@info "Saved `$fn`."
+	end
+end  
+
 # ╔═╡ 65d6b218-8a99-4df5-a2a8-0db3531e3b2f
  let
   dfs = map(instruments) do inst
@@ -643,21 +674,28 @@ end
       df = DataFrame(
           instrument = fill(inst, length(d.t)),
           t          = d.t,
-          rv_obs     = rv_raw,
-          rv_clean   = rv_clean,
-          rv_orbit   = zeros(length(d.t)),
-          rv_resid   = rv_clean,
-          sigma_rv   = d.σrvs,
+          RV_C       = rv_clean,
+		  #rv_obs     = rv_raw,
+          #rv_clean   = rv_clean,
+          #rv_orbit   = zeros(length(d.t)),
+          #rv_resid   = rv_clean,
+		  sigma_rv   = d.σrvs,
+		  RV_A       = d.rvs - rv_clean
       )
+	  #df[!,"Standardd File Name"] = TODO
       for k in 1:r.k_0
-          df[!, "shape_score_$k"] = r.u_loocv[:, k]
-          df[!, "rv_score_$k"]    = r.α_loocv[:, k]
+          df[!, "Ind. $k"] = r.u_loocv[:, k]
+		  #df[!, "shape_score_$k"] = r.u_loocv[:, k]
+          #df[!, "rv_score_$k"]    = r.α_loocv[:, k]
       end
       df
   end
   df = sort(vcat(dfs...; cols = :union), [:instrument, :t])
-  CSV.write(joinpath(results_dir, "results_0pl.csv"), df)
-  md"Saved `results_0pl.csv` ($(nrow(df)) rows, $(ncol(df)) columns)."
+  rename!(df, "t" => "Time [eMJD]")
+  rename!(df, "sigma_rv" => "eRV_C")
+  fn = last(split(data_dir,"/")) * "_PSU_Scalpels0pl_results.csv"
+  CSV.write(joinpath(results_dir, fn), df)
+  @info "Saved $fn ($(nrow(df)) rows, $(ncol(df)) columns)."
   end
 
 # ╔═╡ f795600d-f744-45e2-b805-b21ace067d6d
@@ -669,45 +707,56 @@ end
           f   = fr.final_fit
           d   = inst_data[inst]
           df  = DataFrame(
-              instrument = fill(inst, length(d.t)),
-              t          = d.t,
-              rv_obs     = d.rvs .- mean(d.rvs),
-              rv_clean   = vec(f.rvclean),
-              rv_orbit   = vec(f.rvorbit),
-              rv_resid   = vec(f.rvresid),
+			  instrument = fill(inst, length(d.t)),
+              t       = d.t,
+              #rv_obs     = d.rvs .- mean(d.rvs),
+			  #rv_clean   = vec(f.rvclean),
+              #rv_orbit   = vec(f.rvorbit),
+              #rv_resid   = vec(f.rvresid),
+			  RV_C       = vec(f.rvresid) .+ vec(f.rvorbit),
               sigma_rv   = d.σrvs,
+			  RV_A       = d.rvs - vec(f.rvresid) .+ vec(f.rvorbit)
           )
+		  #df[!,"Standardd File Name"] = TODO
           for k in 1:size(f.u_loocv, 2)
-              df[!, "shape_score_$k"] = f.u_loocv[:, k]
-              df[!, "rv_score_$k"]    = f.α_loocv[:, k]
+              df[!, "Ind. $k"] = f.u_loocv[:, k]
+			  #df[!, "shape_score_$k"] = f.u_loocv[:, k]
+              #df[!, "rv_score_$k"]    = f.α_loocv[:, k]
           end
           df
       end
       df = sort(vcat(dfs...; cols = :union), [:instrument, :t])
-      CSV.write(joinpath(results_dir, "results_$(num_pl)pl.csv"), df)
+	  rename!(df, "t" => "Time [eMJD]")
+	  rename!(df, "sigma_rv" => "eRV_C")
+	  fn = last(split(data_dir,"/")) * "_PSU_Scalpels$(num_pl)pl_results.csv"
+	  CSV.write(joinpath(results_dir, fn), df)
+  	@info "Saved " fn
   end
-  md"Saved `results_1pl.csv` … `results_$(max_num_pl)pl.csv`."
+	wrote_results_files = true
   end
 
-# ╔═╡ b0000005-0000-0000-0000-000000000005
+# ╔═╡ c8c22be8-6a0f-4ee7-b6a6-a5e81d05a7a8
+final_summary
+
+# ╔═╡ 9bbd555e-73e5-4f08-868c-ab0cd3fe9996
 let
-CSV.write(joinpath(results_dir, "final_summary.csv"), final_summary)
-md"Saved `final_summary.csv`."
+	wrote_results_files
+	num_pl_to_use_for_DS = [ 1, 1, 1, 2, 2, 1, 2, 2, 0 ]
+	DSid = parse(Int,last(split(data_dir,"/"))[3])
+	num_pl_to_use_for_DS[DSid]
+	fn_in = last(split(data_dir,"/")) * "_PSU_Scalpels" * string(num_pl_to_use_for_DS[DSid]) * "pl_results.csv"
+	fn_out = last(split(data_dir,"/")) * "_PSU_Scalpels_results.csv"
+	cp(joinpath(results_dir,fn_in),joinpath(results_dir,fn_out), force=true)
+	if num_pl_to_use_for_DS[DSid] >= 1
+		fn_in = last(split(data_dir,"/")) * "_PSU_Scalpels" * string(num_pl_to_use_for_DS[DSid]) * "pl_planetFit.csv"
+		fn_out = last(split(data_dir,"/")) * "_PSU_Scalpels_planetFit.csv"
+		cp(joinpath(results_dir,fn_in),joinpath(results_dir,fn_out), force=true)
+	end
+	num_pl_to_use_for_DS[DSid]
 end
 
-# ╔═╡ b0000006-0000-0000-0000-000000000006
-md"""
-### Output files
-
-```
-$(results_dir)/
-  results_0pl.csv      — instrument, t, rv_obs, rv_clean, rv_orbit, rv_resid, sigma_rv
-  results_1pl.csv      — 1-planet model (same columns)
-  results_2pl.csv      — 2-planet model
-  results_3pl.csv      — 3-planet model
-  final_summary.csv    — per-instrument best-model recommendation
-```
-"""
+# ╔═╡ 0748f263-2e29-4742-9e5a-5ea566e47919
+CSV.write(joinpath(data_dir,"summary.csv"),final_summary)
 
 # ╔═╡ 30000008-0000-0000-0000-000000000008
 """Save `fig` to `path` when running as a script; returns `fig` in all cases."""
@@ -1042,7 +1091,8 @@ end
 # ╟─30000003-0000-0000-0000-000000000003
 # ╟─30000004-0000-0000-0000-000000000004
 # ╟─30000005-0000-0000-0000-000000000005
-# ╠═30000006-0000-0000-0000-000000000006
+# ╟─30000006-0000-0000-0000-000000000006
+# ╠═be979827-99c1-4c98-be9a-911de0cd72ca
 # ╟─30000007-0000-0000-0000-000000000007
 # ╟─35000001-0000-0000-0000-000000000001
 # ╟─40000001-0000-0000-0000-000000000001
@@ -1070,7 +1120,6 @@ end
 # ╟─fb225623-1b50-4679-8eaf-397421b0ecfc
 # ╟─80000004-0000-0000-0000-000000000004
 # ╠═80000005-0000-0000-0000-000000000005
-# ╠═d13fae7f-cf03-49fc-a85b-7368b06e93b1
 # ╟─90000001-0000-0000-0000-000000000001
 # ╠═90000002-0000-0000-0000-000000000002
 # ╠═90000003-0000-0000-0000-000000000003
@@ -1098,6 +1147,8 @@ end
 # ╠═106ed2f6-6fa5-48b5-b5b2-1b55944a9068
 # ╟─a0000001-0000-0000-0000-000000000001
 # ╠═a0000002-0000-0000-0000-000000000002
+# ╠═6b414786-1bef-49d5-b611-809b50f2d778
+# ╠═eb5eebd0-0cdb-4032-a1c5-0e762d939435
 # ╟─ed7b8dfc-68b5-4f4a-b973-20e930b0f718
 # ╠═cc45a010-7689-4c0e-9b19-15567ee159c4
 # ╟─f388e23a-739a-434c-a8b3-23f3137b5a02
@@ -1105,6 +1156,7 @@ end
 # ╠═b0000002-0000-0000-0000-000000000002
 # ╠═65d6b218-8a99-4df5-a2a8-0db3531e3b2f
 # ╠═f795600d-f744-45e2-b805-b21ace067d6d
-# ╠═b0000005-0000-0000-0000-000000000005
-# ╟─b0000006-0000-0000-0000-000000000006
+# ╠═c8c22be8-6a0f-4ee7-b6a6-a5e81d05a7a8
+# ╠═9bbd555e-73e5-4f08-868c-ab0cd3fe9996
+# ╠═0748f263-2e29-4742-9e5a-5ea566e47919
 # ╟─30000008-0000-0000-0000-000000000008
